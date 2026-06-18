@@ -232,10 +232,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 780)
         self.setStyleSheet(STYLESHEET)
 
-        self._worker       = None
-        self._last_qr      = None
-        self._scan_enabled = False
-        self._frame_count  = 0
+        self._worker        = None
+        self._latest_frame  = None    # last frame from camera (for capture)
+        self._frame_count   = 0
 
         init_db()
         self._build_ui()
@@ -298,17 +297,22 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self._btn_stop)
         sb_layout.addSpacing(12)
 
-        lbl_scan = QLabel("SCANNING")
+        lbl_scan = QLabel("CAPTURE")
         lbl_scan.setObjectName("section_title")
         sb_layout.addWidget(lbl_scan)
 
-        self._btn_scan = QPushButton("Start Scanning")
-        self._btn_scan.setProperty("class", "action")
-        self._btn_scan.setFixedHeight(40)
-        self._btn_scan.setEnabled(False)
-        self._btn_scan.clicked.connect(self._on_toggle_scan)
+        self._btn_capture = QPushButton("📷  Capture & Scan")
+        self._btn_capture.setProperty("class", "action")
+        self._btn_capture.setFixedHeight(48)
+        self._btn_capture.setEnabled(False)
+        self._btn_capture.clicked.connect(self._on_capture)
 
-        sb_layout.addWidget(self._btn_scan)
+        sb_layout.addWidget(self._btn_capture)
+
+        hint = QLabel("Camera connect karo, phir Capture dabao.\nQR auto-detect hoga.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color:{C_MUTED}; font-size:10px; padding-top:2px;")
+        sb_layout.addWidget(hint)
         sb_layout.addSpacing(12)
 
         lbl_save = QLabel("LAST SAVE")
@@ -439,7 +443,7 @@ class MainWindow(QMainWindow):
     def _on_connect(self):
         self._btn_connect.setEnabled(False)
         self._btn_connect.setText("Connecting...")
-        self._set_badge(self._cam_badge, "on")
+        self._status.showMessage("Camera connect ho raha hai...")
 
         self._worker = CameraWorker()
         self._worker.frame_ready.connect(self._on_frame)
@@ -448,57 +452,42 @@ class MainWindow(QMainWindow):
         self._worker.start_camera()
 
     def _on_camera_opened(self):
+        self._set_badge(self._cam_badge, "on")
+        self._btn_connect.setText("Connected ✓")
         self._btn_stop.setEnabled(True)
-        self._btn_scan.setEnabled(True)
-        self._status.showMessage("Camera connected")
+        self._btn_capture.setEnabled(True)
+        self._status.showMessage("Camera connected — Capture dabane ke liye ready")
 
     def _on_camera_error(self, msg: str):
         self._set_badge(self._cam_badge, "error")
         self._btn_connect.setEnabled(True)
         self._btn_connect.setText("Connect Camera")
-        self._btn_scan.setEnabled(False)
+        self._btn_capture.setEnabled(False)
         self._status.showMessage(f"Camera error: {msg}")
         QMessageBox.critical(self, "Camera Error", msg)
 
     def _on_disconnect(self):
         if self._worker:
-            self._scan_enabled = False
             self._worker.stop_camera()
             self._worker = None
+        self._latest_frame = None
         self._set_badge(self._cam_badge, "off")
         self._btn_connect.setEnabled(True)
         self._btn_connect.setText("Connect Camera")
         self._btn_stop.setEnabled(False)
-        self._btn_scan.setEnabled(False)
-        self._btn_scan.setText("Start Scanning")
+        self._btn_capture.setEnabled(False)
         self._lbl_feed.setText("No camera connected")
         self._lbl_feed.setPixmap(QPixmap())
+        self._lbl_qr_live.setText("")
         self._status.showMessage("Camera disconnected")
 
     # ---------------------------------------------------------------------- #
-    # Scan toggle                                                              #
-    # ---------------------------------------------------------------------- #
-    def _on_toggle_scan(self):
-        self._scan_enabled = not self._scan_enabled
-        if self._scan_enabled:
-            self._btn_scan.setText("Stop Scanning")
-            self._set_badge(self._cam_badge, "scanning")
-            self._last_qr = None
-        else:
-            self._btn_scan.setText("Start Scanning")
-            self._set_badge(self._cam_badge, "on")
-            self._lbl_qr_live.setText("")
-
-    # ---------------------------------------------------------------------- #
-    # Frame processing                                                         #
+    # Frame processing — sirf store + display, decode NAHI                    #
     # ---------------------------------------------------------------------- #
     def _on_frame(self, frame):
         self._frame_count += 1
+        self._latest_frame = frame          # capture ke liye store
 
-        if self._scan_enabled:
-            self._try_decode(frame)
-
-        # Display
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -507,51 +496,90 @@ class MainWindow(QMainWindow):
         )
         self._lbl_feed.setPixmap(pix)
 
-    def _try_decode(self, frame):
-        try:
-            results = zxingcpp.read_barcodes(frame)
-        except Exception:
+    # ---------------------------------------------------------------------- #
+    # CAPTURE button — yahan QR detect hota hai                               #
+    # ---------------------------------------------------------------------- #
+    def _on_capture(self):
+        if self._latest_frame is None:
+            self._show_error("Koi frame nahi mila. Camera connect hai?")
             return
 
+        frame = self._latest_frame.copy()    # freeze current frame
+
+        # Decode QR codes
+        codes = self._decode_qr(frame)
+
+        if not codes:
+            # QR nahi mila -> error dikhao, SAVE MAT KARO
+            self._show_error("QR code detect nahi hua. Image save nahi hui.")
+            self._lbl_qr_live.setText("")
+            return
+
+        # QR mila -> save karo
+        joined = ", ".join(codes)
+        self._lbl_qr_live.setText(f"QR: {joined}")
+        self._lbl_qr_live.setStyleSheet(
+            f"color:{C_SUCCESS}; font-size:13px; font-weight:700;"
+        )
+        self._save_scan(frame, codes)
+
+    def _decode_qr(self, frame) -> list:
+        """Returns list of unique QR strings found in frame."""
+        try:
+            results = zxingcpp.read_barcodes(frame)
+        except Exception as e:
+            self._status.showMessage(f"Decode error: {e}")
+            return []
+
+        codes = []
         for r in results:
-            code = r.text.strip()
-            if not code or code == self._last_qr:
-                continue
+            text = r.text.strip()
+            if text and text not in codes:
+                codes.append(text)
+        return codes
 
-            self._last_qr = code
-            self._lbl_qr_live.setText(f"QR: {code}")
-            self._save_scan(frame, code)
-            break
+    def _show_error(self, msg: str):
+        self._lbl_qr_live.setText(f"✕ {msg}")
+        self._lbl_qr_live.setStyleSheet(
+            f"color:{C_ERROR}; font-size:13px; font-weight:700;"
+        )
+        self._status.showMessage(msg)
 
     # ---------------------------------------------------------------------- #
-    # Save                                                                     #
+    # Save (QR mile tabhi call hota hai)                                      #
     # ---------------------------------------------------------------------- #
-    def _save_scan(self, frame, qr_code: str):
+    def _save_scan(self, frame, qr_codes: list):
         ts       = datetime.now()
         ts_str   = ts.strftime("%Y%m%d_%H%M%S")
-        safe_qr  = "".join(c if c.isalnum() or c in "-_" else "_" for c in qr_code)[:60]
+
+        # Filename: pehle QR code se, multiple ho to joined
+        primary  = qr_codes[0]
+        safe_qr  = "".join(c if c.isalnum() or c in "-_" else "_" for c in primary)[:50]
+        if len(qr_codes) > 1:
+            safe_qr += f"_+{len(qr_codes)-1}more"
         filename = f"{safe_qr}_{ts_str}.jpg"
 
-        # Write to temp file
+        # Temp file
         tmp = tempfile.mktemp(suffix=".jpg")
         cv2.imwrite(tmp, frame, [cv2.IMWRITE_JPEG_QUALITY, cfg.JPEG_QUALITY])
 
-        # Save to NAS / fallback
+        # NAS / fallback
         saved_path, location = save_image(tmp, filename)
         try:
             os.remove(tmp)
         except Exception:
             pass
 
-        # DB
-        insert_scan(qr_code, filename, saved_path, ts.isoformat())
+        # DB — saare codes comma-separated store
+        all_codes = " | ".join(qr_codes)
+        insert_scan(all_codes, filename, saved_path, ts.isoformat())
 
         # UI feedback
         color = C_SUCCESS if location == "NAS" else C_WARN
         self._lbl_dest.setText(f"[{location}]\n{saved_path}")
         self._lbl_dest.setStyleSheet(f"color:{color}; font-size:11px;")
         self._status.showMessage(
-            f"Saved [{location}]: {filename}  |  {ts.strftime('%H:%M:%S')}"
+            f"✓ Saved [{location}]: {filename}  |  {len(qr_codes)} QR  |  {ts.strftime('%H:%M:%S')}"
         )
         self._refresh_table()
 
