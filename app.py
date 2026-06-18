@@ -222,6 +222,69 @@ class CameraWorker(QThread):
 
 
 # --------------------------------------------------------------------------- #
+# Capture worker thread — decode + save + NAS + DB (background, no UI freeze)  #
+# --------------------------------------------------------------------------- #
+class CaptureWorker(QThread):
+    # Signals back to UI
+    done_success = pyqtSignal(list, str, str)   # codes, saved_path, location
+    done_no_qr   = pyqtSignal()
+    done_error   = pyqtSignal(str)
+
+    def __init__(self, frame):
+        super().__init__()
+        self._frame = frame
+
+    def run(self):
+        frame = self._frame
+        try:
+            # 1. Decode QR (heavy)
+            try:
+                results = zxingcpp.read_barcodes(frame)
+            except Exception as e:
+                self.done_error.emit(f"Decode error: {e}")
+                return
+
+            codes = []
+            for r in results:
+                text = r.text.strip()
+                if text and text not in codes:
+                    codes.append(text)
+
+            if not codes:
+                self.done_no_qr.emit()
+                return
+
+            # 2. Build filename
+            ts       = datetime.now()
+            ts_str   = ts.strftime("%Y%m%d_%H%M%S")
+            primary  = codes[0]
+            safe_qr  = "".join(c if c.isalnum() or c in "-_" else "_" for c in primary)[:50]
+            if len(codes) > 1:
+                safe_qr += f"_+{len(codes)-1}more"
+            filename = f"{safe_qr}_{ts_str}.jpg"
+
+            # 3. Write temp JPEG
+            tmp = tempfile.mktemp(suffix=".jpg")
+            cv2.imwrite(tmp, frame, [cv2.IMWRITE_JPEG_QUALITY, cfg.JPEG_QUALITY])
+
+            # 4. Save to NAS / fallback (slow — but we're off the UI thread)
+            saved_path, location = save_image(tmp, filename)
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+            # 5. DB write
+            all_codes = " | ".join(codes)
+            insert_scan(all_codes, filename, saved_path, ts.isoformat())
+
+            self.done_success.emit(codes, saved_path, location)
+
+        except Exception as e:
+            self.done_error.emit(f"Capture failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
 # Main Window                                                                   #
 # --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
@@ -232,9 +295,10 @@ class MainWindow(QMainWindow):
         self.resize(1280, 780)
         self.setStyleSheet(STYLESHEET)
 
-        self._worker        = None
-        self._latest_frame  = None    # last frame from camera (for capture)
-        self._frame_count   = 0
+        self._worker         = None
+        self._capture_worker = None
+        self._latest_frame   = None    # last frame from camera (for capture)
+        self._frame_count    = 0
 
         init_db()
         self._build_ui()
@@ -497,31 +561,64 @@ class MainWindow(QMainWindow):
         self._lbl_feed.setPixmap(pix)
 
     # ---------------------------------------------------------------------- #
-    # CAPTURE button — yahan QR detect hota hai                               #
+    # CAPTURE button — heavy kaam background thread pe, UI freeze NAHI        #
     # ---------------------------------------------------------------------- #
     def _on_capture(self):
         if self._latest_frame is None:
             self._show_error("Koi frame nahi mila. Camera connect hai?")
             return
 
-        frame = self._latest_frame.copy()    # freeze current frame
-
-        # Decode QR codes
-        codes = self._decode_qr(frame)
-
-        if not codes:
-            # QR nahi mila -> error dikhao, SAVE MAT KARO
-            self._show_error("QR code detect nahi hua. Image save nahi hui.")
-            self._lbl_qr_live.setText("")
+        # Agar pehle wala capture abhi chal raha hai, ignore
+        if self._capture_worker and self._capture_worker.isRunning():
+            self._status.showMessage("Pichla capture process ho raha hai, ruko...")
             return
 
-        # QR mila -> save karo
+        frame = self._latest_frame.copy()    # freeze current frame
+
+        # UI: button disable + "processing" feedback (turant)
+        self._btn_capture.setEnabled(False)
+        self._btn_capture.setText("⏳ Processing...")
+        self._lbl_qr_live.setText("Scanning...")
+        self._lbl_qr_live.setStyleSheet(
+            f"color:{C_ACCENT}; font-size:13px; font-weight:700;"
+        )
+        self._status.showMessage("QR detect ho raha hai aur save ho raha hai...")
+
+        # Background worker start — UI yahan se free
+        self._capture_worker = CaptureWorker(frame)
+        self._capture_worker.done_success.connect(self._on_capture_success)
+        self._capture_worker.done_no_qr.connect(self._on_capture_no_qr)
+        self._capture_worker.done_error.connect(self._on_capture_error)
+        self._capture_worker.finished.connect(self._reset_capture_button)
+        self._capture_worker.start()
+
+    def _reset_capture_button(self):
+        self._btn_capture.setEnabled(True)
+        self._btn_capture.setText("📷  Capture & Scan")
+
+    def _on_capture_success(self, codes, saved_path, location):
         joined = ", ".join(codes)
         self._lbl_qr_live.setText(f"QR: {joined}")
         self._lbl_qr_live.setStyleSheet(
             f"color:{C_SUCCESS}; font-size:13px; font-weight:700;"
         )
-        self._save_scan(frame, codes)
+        color = C_SUCCESS if location == "NAS" else C_WARN
+        self._lbl_dest.setText(f"[{location}]\n{saved_path}")
+        self._lbl_dest.setStyleSheet(f"color:{color}; font-size:11px;")
+        self._status.showMessage(
+            f"✓ Saved [{location}]: {len(codes)} QR  |  {datetime.now().strftime('%H:%M:%S')}"
+        )
+        self._refresh_table()
+
+    def _on_capture_no_qr(self):
+        self._show_error("QR code detect nahi hua. Image save nahi hui.")
+        self._lbl_qr_live.setText("✕ No QR found")
+        self._lbl_qr_live.setStyleSheet(
+            f"color:{C_ERROR}; font-size:13px; font-weight:700;"
+        )
+
+    def _on_capture_error(self, msg):
+        self._show_error(msg)
 
     def _decode_qr(self, frame) -> list:
         """Returns list of unique QR strings found in frame."""
@@ -544,44 +641,6 @@ class MainWindow(QMainWindow):
             f"color:{C_ERROR}; font-size:13px; font-weight:700;"
         )
         self._status.showMessage(msg)
-
-    # ---------------------------------------------------------------------- #
-    # Save (QR mile tabhi call hota hai)                                      #
-    # ---------------------------------------------------------------------- #
-    def _save_scan(self, frame, qr_codes: list):
-        ts       = datetime.now()
-        ts_str   = ts.strftime("%Y%m%d_%H%M%S")
-
-        # Filename: pehle QR code se, multiple ho to joined
-        primary  = qr_codes[0]
-        safe_qr  = "".join(c if c.isalnum() or c in "-_" else "_" for c in primary)[:50]
-        if len(qr_codes) > 1:
-            safe_qr += f"_+{len(qr_codes)-1}more"
-        filename = f"{safe_qr}_{ts_str}.jpg"
-
-        # Temp file
-        tmp = tempfile.mktemp(suffix=".jpg")
-        cv2.imwrite(tmp, frame, [cv2.IMWRITE_JPEG_QUALITY, cfg.JPEG_QUALITY])
-
-        # NAS / fallback
-        saved_path, location = save_image(tmp, filename)
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-
-        # DB — saare codes comma-separated store
-        all_codes = " | ".join(qr_codes)
-        insert_scan(all_codes, filename, saved_path, ts.isoformat())
-
-        # UI feedback
-        color = C_SUCCESS if location == "NAS" else C_WARN
-        self._lbl_dest.setText(f"[{location}]\n{saved_path}")
-        self._lbl_dest.setStyleSheet(f"color:{color}; font-size:11px;")
-        self._status.showMessage(
-            f"✓ Saved [{location}]: {filename}  |  {len(qr_codes)} QR  |  {ts.strftime('%H:%M:%S')}"
-        )
-        self._refresh_table()
 
     # ---------------------------------------------------------------------- #
     # History table                                                            #
