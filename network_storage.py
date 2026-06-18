@@ -4,6 +4,7 @@ network_storage.py - Save images to NAS (SMB) with local fallback.
 import os
 import shutil
 import sys
+import socket
 from config_loader import cfg
 
 
@@ -19,15 +20,34 @@ def _local_fallback_dir():
     return path
 
 
+def _nas_reachable(timeout: float = 2.0) -> bool:
+    """
+    Fast check: try TCP connect to NAS on SMB port 445.
+    Avoids the long Windows network-path timeout (can be 20-30s).
+    """
+    ip = cfg.PRODUCTION_IP
+    for port in (445, 139):
+        try:
+            sock = socket.create_connection((ip, port), timeout=timeout)
+            sock.close()
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def save_image(src_path: str, filename: str) -> tuple:
     """
-    Try NAS first, fall back to local.
+    Try NAS first (with fast pre-check), fall back to local.
     Returns (saved_path, "NAS" | "LOCAL").
     """
     remote_dir = cfg.REMOTE_SAVE_DIR
     try:
+        # Fast TCP pre-check before touching the network path
+        if not _nas_reachable():
+            raise OSError(f"NAS not reachable: {cfg.PRODUCTION_IP}")
         if not os.path.isdir(remote_dir):
-            raise OSError(f"NAS not reachable: {remote_dir}")
+            raise OSError(f"NAS path missing: {remote_dir}")
         dest = os.path.join(remote_dir, filename)
         shutil.copy2(src_path, dest)
         return dest, "NAS"
