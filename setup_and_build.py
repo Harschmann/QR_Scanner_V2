@@ -22,7 +22,7 @@ DIST = os.path.join(ROOT, "dist", "QRScanner")
 DEPENDENCIES = [
     "pyinstaller",
     "opencv-python",
-    "zxingcpp",
+    "zxing-cpp",       # import name: zxingcpp
     "PyQt5",
     "pypylon",
 ]
