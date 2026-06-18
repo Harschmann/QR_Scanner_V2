@@ -1,0 +1,56 @@
+"""
+config_loader.py - Loads config.py from same folder as EXE or script.
+Auto-recreates with defaults if missing.
+"""
+import sys
+import os
+import importlib.util
+
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_PATH = os.path.join(BASE_DIR, "config.py")
+
+DEFAULT_CONFIG = '''# =============================================================================
+# QR Scanner - Configuration File
+# Edit with Notepad, save, restart app. No rebuild needed.
+# =============================================================================
+
+# --- NAS / Network Storage ---
+PRODUCTION_IP        = "192.168.1.100"
+SHARE_NAME           = "QRCaptures"
+SUBFOLDER            = "scans"
+REMOTE_SAVE_DIR      = ""
+
+# --- Local Fallback ---
+LOCAL_FALLBACK_DIR   = "captures_local_backup"
+
+# --- Basler Camera Settings ---
+CAMERA_EXPOSURE_US   = 10000
+CAMERA_FPS           = 30
+
+# --- Database ---
+DB_PATH              = "qr_scan.db"
+
+# --- Image Quality ---
+JPEG_QUALITY         = 90
+'''
+
+def _write_default():
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(DEFAULT_CONFIG)
+
+def _load():
+    if not os.path.exists(CONFIG_PATH):
+        _write_default()
+    spec = importlib.util.spec_from_file_location("config", CONFIG_PATH)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # Build REMOTE_SAVE_DIR if blank
+    if not getattr(mod, "REMOTE_SAVE_DIR", "").strip():
+        mod.REMOTE_SAVE_DIR = f"\\\\{mod.PRODUCTION_IP}\\{mod.SHARE_NAME}\\{mod.SUBFOLDER}"
+    return mod
+
+cfg = _load()
